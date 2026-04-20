@@ -13,6 +13,8 @@ Window {
 
     minimumWidth: 900
     minimumHeight: 520
+    // 持有 HomePage 引用，避免 createObject(null) 创建的窗口被 QML GC 回收
+    property var homeWindowRef: null
 
     // 登录失败提示
     MessageDialog {
@@ -231,12 +233,14 @@ Window {
                             PlaybackManager.setSdkPin(passwordField.text)
                             var component = Qt.createComponent("HomePage.qml")
                             if (component.status === Component.Ready) {
-                                var win = component.createObject(null, {
+                                root.homeWindowRef = component.createObject(null, {
                                     "serverIp": serverIpCombo.editText,
                                     "serverPort": serverPortField.text
                                 })
-                                if (!win)
+                                if (!root.homeWindowRef)
                                     console.log("HomePage create failed")
+                                else
+                                    root.homeWindowRef.destroyed.connect(function() { root.homeWindowRef = null })
                             } else {
                                 console.log("HomePage component error:", component.errorString())
                             }

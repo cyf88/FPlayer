@@ -43,6 +43,22 @@ QImage yuv420pToRgbImage(const uint8_t *data, int width, int height)
 }
 }
 
+void PlaybackManager::stopRtsp()
+{
+    m_rtspPlaying = false;
+    if (m_rtspClient) {
+        m_rtspClient->stop();
+        m_rtspClient.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_rtspMutex);
+        if (m_rtspDecodeHandle != 0) {
+            m_sdkManager.closeHandle(m_rtspDecodeHandle);
+            m_rtspDecodeHandle = 0;
+        }
+    }
+}
+
 PlaybackManager::PlaybackManager(QObject *parent)
     : QObject(parent)
     , m_sdkManager(SDKManager::instance())
@@ -60,14 +76,25 @@ PlaybackManager::PlaybackManager(QObject *parent)
         const QImage rgbImage = yuv420pToRgbImage(frame.data.data(), frame.width, frame.height);
         if (!rgbImage.isNull()) {
             m_svacGotPicture = true;
+            bool expected = false;
+            if (!m_frameUpdateQueued.compare_exchange_strong(expected, true)) {
+                ++m_decodedFrameCount;
+                return;
+            }
             QMetaObject::invokeMethod(this, [this, rgbImage]() {
                 SvacImageProvider::setLatestFrame(rgbImage);
                 ++m_frameSerial;
                 emit frameSerialChanged();
+                m_frameUpdateQueued = false;
             }, Qt::QueuedConnection);
         }
         ++m_decodedFrameCount;
     });
+}
+
+PlaybackManager::~PlaybackManager()
+{
+    stopRtsp();
 }
 
 void PlaybackManager::setSdkPin(const QString &pin)
@@ -202,6 +229,87 @@ bool PlaybackManager::playPsFile(const QUrl &fileUrl)
         m_isPlaying = false;
     });
 
+    return true;
+}
+
+bool PlaybackManager::playRtspUrl(const QString &rtspUrl)
+{
+    if (rtspUrl.trimmed().isEmpty()) {
+        emit playFailed(QStringLiteral("RTSP 地址为空"));
+        return false;
+    }
+
+    QString reason;
+    if (!ensureReady(reason)) {
+        emit playFailed(reason);
+        return false;
+    }
+
+    stopRtsp();
+
+    m_rtspDecodeHandle = 0;
+    unsigned long decodeHandle = 0;
+    const auto ret = m_sdkManager.getStreamSecDecode(decodeHandle);
+    if (ret != 0) {
+        emit playFailed(QStringLiteral("RTSP 申请解密通道失败, code=%1").arg(ret));
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_rtspMutex);
+        m_rtspDecodeHandle = decodeHandle;
+    }
+
+    m_decodedFrameCount = 0;
+    m_svacGotPicture = false;
+    m_rtspPlaying = true;
+
+    m_rtspClient = std::make_shared<rtspwrap::RTSPClientWrapper>();
+    const std::string url = rtspUrl.toStdString();
+    const bool started = m_rtspClient->start(url, [this](const uint8_t *data, unsigned size, timeval) {
+        if (!m_rtspPlaying || !data || size == 0)
+            return;
+
+        IMG_FRAME_UNIT inFrame{};
+        // RTSP 密流先按 I 尝试，避免初始 P 帧导致底层不输出
+        inFrame.type = 'I';
+        inFrame.imgsz = size;
+        inFrame.img_buf = const_cast<uint8_t *>(data);
+
+        IMG_FRAME_UNIT *outFrame = nullptr;
+        unsigned long handle = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_rtspMutex);
+            handle = m_rtspDecodeHandle;
+        }
+        if (handle == 0)
+            return;
+
+        const auto decRet = m_sdkManager.videoDataSecDecodeExt(handle, &inFrame, &outFrame, false);
+        if (decRet != 0 || !outFrame || !outFrame->img_buf || outFrame->imgsz == 0) {
+            if (outFrame)
+                m_sdkManager.freeFrame(&outFrame);
+            return;
+        }
+
+        Frame svacFrame;
+        svacFrame.keyFrame = !m_svacGotPicture;
+        svacFrame.data.assign(outFrame->img_buf, outFrame->img_buf + outFrame->imgsz);
+        svacFrame.size = svacFrame.data.size();
+        svacFrame.timestamp = 0;
+        svacFrame.width = static_cast<int>(outFrame->width);
+        svacFrame.height = static_cast<int>(outFrame->height);
+
+        m_svacDecoder.inputFrame(svacFrame);
+        m_sdkManager.freeFrame(&outFrame);
+    });
+
+    if (!started) {
+        stopRtsp();
+        emit playFailed(QStringLiteral("RTSP 启动失败: %1").arg(rtspUrl));
+        return false;
+    }
+
+    emit playStarted(rtspUrl);
     return true;
 }
 

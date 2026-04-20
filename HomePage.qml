@@ -421,8 +421,12 @@ Window {
                                         resourceTree.toggleExpanded(row)
                                         return
                                     }
-                                    // camera：后续你可以在这里触发右侧预览
-                                    console.log("camera clicked, id=", model.id, "label=", model.label)
+                                    // camera：点击后拉取 RTSP SVAC 密流到右侧预览区
+                                    var testRtsp = "rtsp://172.17.42.63:554/rtp/13100000002001000111_11010600001310000001"
+                                    var ok = PlaybackManager.playRtspUrl(testRtsp)
+                                    if (!ok) {
+                                        playbackHint = qsTr("RTSP 播放启动失败")
+                                    }
                                 }
                             }
                         }
