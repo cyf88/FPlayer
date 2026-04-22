@@ -25,8 +25,33 @@ Window {
     property var cameraSearchResults: []
     // 预览分屏模式：1/4/9
     property int previewSplit: 1
+    property int selectedPreviewIndex: -1
     property string playbackHint: ""
     property bool psPlaying: false
+    property var rtspPlayingSlots: [false, false, false, false, false, false, false, false, false]
+    property var rtspRenderTokens: [0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    function isRtspSlotPlaying(slot) {
+        if (slot < 0 || slot >= rtspPlayingSlots.length)
+            return false
+        return rtspPlayingSlots[slot] === true
+    }
+
+    function setRtspSlotPlaying(slot, playing) {
+        if (slot < 0 || slot >= rtspPlayingSlots.length)
+            return
+        var next = rtspPlayingSlots.slice(0)
+        next[slot] = playing
+        rtspPlayingSlots = next
+    }
+
+    function bumpRtspRenderToken(slot) {
+        if (slot < 0 || slot >= rtspRenderTokens.length)
+            return
+        var next = rtspRenderTokens.slice(0)
+        next[slot] = next[slot] + 1
+        rtspRenderTokens = next
+    }
 
     function windowButtonSymbol(role) {
         if (role === "min") return "—"
@@ -46,7 +71,11 @@ Window {
     Connections {
         target: PlaybackManager
         function onPlayStarted(filePath) {
-            psPlaying = true
+            if (filePath && filePath.toString().startsWith("slot")) {
+                psPlaying = false
+            } else {
+                psPlaying = true
+            }
             playbackHint = qsTr("开始播放: ") + filePath
         }
         function onPlayFinished(decodedFrameCount) {
@@ -57,6 +86,10 @@ Window {
             psPlaying = false
             playbackHint = qsTr("播放失败: ") + reason
         }
+    }
+
+    onClosing: {
+        PlaybackManager.stopRtsp()
     }
 
     // 顶部蓝色工具栏 + 标签
@@ -423,9 +456,19 @@ Window {
                                     }
                                     // camera：点击后拉取 RTSP SVAC 密流到右侧预览区
                                     var testRtsp = "rtsp://172.17.42.63:554/rtp/13100000002001000111_11010600001310000001"
-                                    var ok = PlaybackManager.playRtspUrl(testRtsp)
+                                    //var testRtsp = "rtsp://172.17.43.25:10554/rtp/13100000002001000111_11010600001310000001?originTypeStr=rtp_push"
+                                    var targetSlot = home.selectedPreviewIndex
+                                    if (targetSlot < 0 || targetSlot >= home.previewSplit)
+                                        targetSlot = 0
+                                    var ok = PlaybackManager.playRtspInSlot(targetSlot, testRtsp)
                                     if (!ok) {
-                                        playbackHint = qsTr("RTSP 播放启动失败")
+                                        playbackHint = qsTr("RTSP 播放启动失败(窗口%1)").arg(targetSlot + 1)
+                                    } else {
+                                        home.bumpRtspRenderToken(targetSlot)
+                                        home.setRtspSlotPlaying(targetSlot, true)
+                                        home.selectedPreviewIndex = targetSlot
+                                        psPlaying = false
+                                        playbackHint = qsTr("窗口%1开始播放").arg(targetSlot + 1)
                                     }
                                 }
                             }
@@ -505,20 +548,62 @@ Window {
                                         Layout.fillWidth: true
                                         Layout.fillHeight: true
                                         color: "#000000"
-                                        border.color: "#2A2F36"
-                                        border.width: 1
+                                        border.color: home.selectedPreviewIndex === index ? "#2F88FF" : "#2A2F36"
+                                        border.width: home.selectedPreviewIndex === index ? 2 : 1
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: {
+                                                home.selectedPreviewIndex = index
+                                            }
+                                        }
 
                                         Image {
                                             anchors.fill: parent
-                                            visible: home.psPlaying && index === 0
+                                    visible: (home.psPlaying && index === 0)
+                                                     || home.isRtspSlotPlaying(index)
                                             fillMode: Image.PreserveAspectFit
                                             cache: false
-                                            source: "image://svac/frame?serial=" + PlaybackManager.frameSerial
+                                            source: "image://svac/ch" + index
+                                                    + "?global=" + PlaybackManager.frameSerial
+                                                    + "&slot=" + PlaybackManager.frameSerialForSlot(index)
+                                                    + "&token=" + home.rtspRenderTokens[index]
+                                        }
+
+                                        ToolButton {
+                                            anchors.top: parent.top
+                                            anchors.right: parent.right
+                                            anchors.margins: 6
+                                            width: 24
+                                            height: 24
+                                            visible: home.isRtspSlotPlaying(index)
+                                            text: "✕"
+                                            z: 2
+                                            onClicked: {
+                                                PlaybackManager.stopRtspInSlot(index)
+                                                home.setRtspSlotPlaying(index, false)
+                                                home.bumpRtspRenderToken(index)
+                                                home.playbackHint = qsTr("已关闭窗口%1码流").arg(index + 1)
+                                            }
+                                            background: Rectangle {
+                                                radius: 12
+                                                color: parent.down ? "#AA000000" : "#77000000"
+                                                border.color: "#99FFFFFF"
+                                                border.width: 1
+                                            }
+                                            contentItem: Label {
+                                                text: parent.text
+                                                color: "white"
+                                                horizontalAlignment: Text.AlignHCenter
+                                                verticalAlignment: Text.AlignVCenter
+                                                font.pixelSize: 12
+                                            }
                                         }
 
                                         Label {
                                             anchors.centerIn: parent
-                                            visible: !(home.psPlaying && index === 0)
+                                    visible: !((home.psPlaying && index === 0)
+                                               || home.isRtspSlotPlaying(index))
                                             text: qsTr("画面 ") + (index + 1)
                                             color: "#8FA0B5"
                                             font.pixelSize: 12

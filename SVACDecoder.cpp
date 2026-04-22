@@ -111,7 +111,7 @@ SVACDecoder::~SVACDecoder() {
 
 bool SVACDecoder::inputFrame(const Frame &frame) {
     const auto inputIdx = g_inputFrameIndex.fetch_add(1);
-    BLOG(info) << "[SVAC input] idx=" << inputIdx << " key=" << frame.keyFrame << " size=" << frame.size << " decode_open=" << _vdCtx.decode_open;
+    //BLOG(info) << "[SVAC input] idx=" << inputIdx << " key=" << frame.keyFrame << " size=" << frame.size << " decode_open=" << _vdCtx.decode_open;
 
     if (frame.data.empty() || frame.size == 0) {
         BLOG(warning) << "[SVAC input] empty frame, drop";
@@ -149,7 +149,7 @@ bool SVACDecoder::inputFrame(const Frame &frame) {
             memcpy(outFrame.data.data(), _vdCtx.m_yuv_buf, outSize);
             outFrame.size = outSize;
             //dumpYuvFrame(_vdCtx.m_yuv_buf, outSize, outFrame.width, outFrame.height, frame.keyFrame);
-            BLOG(info) << "[SVAC output] idx=" << inputIdx << " yuvSize=" << outSize << " width=" << outFrame.width << " height=" << outFrame.height;
+           // BLOG(info) << "[SVAC output] idx=" << inputIdx << " yuvSize=" << outSize << " width=" << outFrame.width << " height=" << outFrame.height;
             _cb(outFrame);
         }
     }
@@ -305,7 +305,7 @@ void SVACDecoder::decodeFrame(
     outputSize = 0;
     width = 0;
     height = 0;
-    BLOG(info) << "[SVAC decode] begin key=" << keyFrame << " inputSize=" << inputSize << " decode_open=" << vdCtx->decode_open;
+   // BLOG(info) << "[SVAC decode] begin key=" << keyFrame << " inputSize=" << inputSize << " decode_open=" << vdCtx->decode_open;
 
     if (keyFrame) {
         if (!openDecodeHandle(input, inputSize, vdCtx)) {
@@ -385,7 +385,7 @@ void SVACDecoder::decodeFrame(
         memcpy(output + pixelCount, dec_out.pU, pixelCount / 4);
         memcpy(output + pixelCount + pixelCount / 4, dec_out.pV, pixelCount / 4);
         outputSize = pixelCount * 3 / 2;
-        BLOG(info) << "[SVAC decode] success width=" << width << " height=" << height << " outputSize=" << outputSize;
+       // BLOG(info) << "[SVAC decode] success width=" << width << " height=" << height << " outputSize=" << outputSize;
         return;
 
     } else {

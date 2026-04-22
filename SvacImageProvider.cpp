@@ -3,7 +3,7 @@
 #include <QMutexLocker>
 
 QMutex SvacImageProvider::s_mutex;
-QImage SvacImageProvider::s_latestFrame;
+QHash<QString, QImage> SvacImageProvider::s_latestFrames;
 
 SvacImageProvider::SvacImageProvider()
     : QQuickImageProvider(QQuickImageProvider::Image)
@@ -15,20 +15,26 @@ SvacImageProvider *SvacImageProvider::instance()
     return new SvacImageProvider();
 }
 
-void SvacImageProvider::setLatestFrame(const QImage &image)
+void SvacImageProvider::setLatestFrame(const QString &channelId, const QImage &image)
 {
     QMutexLocker locker(&s_mutex);
-    s_latestFrame = image;
+    s_latestFrames.insert(channelId, image);
+}
+
+void SvacImageProvider::clearFrame(const QString &channelId)
+{
+    QMutexLocker locker(&s_mutex);
+    s_latestFrames.remove(channelId);
 }
 
 QImage SvacImageProvider::requestImage(const QString &id, QSize *size, const QSize &requestedSize)
 {
-    Q_UNUSED(id)
+    const QString channelId = id.section('?', 0, 0);
 
     QImage image;
     {
         QMutexLocker locker(&s_mutex);
-        image = s_latestFrame;
+        image = s_latestFrames.value(channelId);
     }
 
     if (image.isNull()) {

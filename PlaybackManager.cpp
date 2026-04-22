@@ -45,18 +45,41 @@ QImage yuv420pToRgbImage(const uint8_t *data, int width, int height)
 
 void PlaybackManager::stopRtsp()
 {
-    m_rtspPlaying = false;
-    if (m_rtspClient) {
-        m_rtspClient->stop();
-        m_rtspClient.reset();
+    std::lock_guard<std::mutex> lock(m_rtspMutex);
+    for (int i = 0; i < kMaxRtspSlots; ++i) {
+        stopRtspSlotLocked(i);
     }
-    {
-        std::lock_guard<std::mutex> lock(m_rtspMutex);
-        if (m_rtspDecodeHandle != 0) {
-            m_sdkManager.closeHandle(m_rtspDecodeHandle);
-            m_rtspDecodeHandle = 0;
-        }
+}
+
+void PlaybackManager::stopRtspInSlot(int slot)
+{
+    if (slot < 0 || slot >= kMaxRtspSlots)
+        return;
+    std::lock_guard<std::mutex> lock(m_rtspMutex);
+    stopRtspSlotLocked(slot);
+}
+
+void PlaybackManager::stopRtspSlotLocked(int slot)
+{
+    auto &ctx = m_rtspSlots[slot];
+    const QString channelId = QStringLiteral("ch%1").arg(slot);
+    ctx.playing = false;
+    if (ctx.client) {
+        ctx.client->stop();
+        ctx.client.reset();
     }
+    if (ctx.decodeHandle != 0) {
+        m_sdkManager.closeHandle(ctx.decodeHandle);
+        ctx.decodeHandle = 0;
+    }
+    ctx.decoder.reset();
+    ctx.svacGotPicture = false;
+    ctx.frameUpdateQueued = false;
+    SvacImageProvider::clearFrame(channelId);
+    ++ctx.frameSerial;
+    ++m_frameSerial;
+    emit frameSerialChanged();
+    ctx.url.clear();
 }
 
 PlaybackManager::PlaybackManager(QObject *parent)
@@ -82,8 +105,9 @@ PlaybackManager::PlaybackManager(QObject *parent)
                 return;
             }
             QMetaObject::invokeMethod(this, [this, rgbImage]() {
-                SvacImageProvider::setLatestFrame(rgbImage);
+                SvacImageProvider::setLatestFrame(QStringLiteral("ch0"), rgbImage);
                 ++m_frameSerial;
+                ++m_rtspSlots[0].frameSerial;
                 emit frameSerialChanged();
                 m_frameUpdateQueued = false;
             }, Qt::QueuedConnection);
@@ -117,6 +141,13 @@ qulonglong PlaybackManager::frameSerial() const
     return m_frameSerial;
 }
 
+qulonglong PlaybackManager::frameSerialForSlot(int slot) const
+{
+    if (slot < 0 || slot >= kMaxRtspSlots)
+        return 0;
+    return m_rtspSlots[slot].frameSerial;
+}
+
 bool PlaybackManager::ensureReady(QString &reason)
 {
     if (!m_sdkManager.isLibraryLoaded()) {
@@ -124,9 +155,12 @@ bool PlaybackManager::ensureReady(QString &reason)
         return false;
     }
 
-    if (!m_svacDecoder.loadLibrary(m_svacDllPath.toStdString())) {
-        reason = QStringLiteral("加载 SVAC 解码库失败: %1").arg(m_svacDllPath);
-        return false;
+    if (!m_svacLibLoaded) {
+        if (!m_svacDecoder.loadLibrary(m_svacDllPath.toStdString())) {
+            reason = QStringLiteral("加载 SVAC 解码库失败: %1").arg(m_svacDllPath);
+            return false;
+        }
+        m_svacLibLoaded = true;
     }
 
     return true;
@@ -203,7 +237,8 @@ bool PlaybackManager::playPsFile(const QUrl &fileUrl)
             }
 
             Frame svacFrame;
-            svacFrame.keyFrame = !m_svacGotPicture || (frameType == PsParser::FrameType::I_frame);
+            //svacFrame.keyFrame = !m_svacGotPicture || (frameType == PsParser::FrameType::I_frame);
+            svacFrame.keyFrame = outFrame->type == 'I';
             svacFrame.data.assign(outFrame->img_buf, outFrame->img_buf + outFrame->imgsz);
             svacFrame.size = svacFrame.data.size();
             svacFrame.timestamp = 0;
@@ -234,6 +269,15 @@ bool PlaybackManager::playPsFile(const QUrl &fileUrl)
 
 bool PlaybackManager::playRtspUrl(const QString &rtspUrl)
 {
+    return playRtspInSlot(0, rtspUrl);
+}
+
+bool PlaybackManager::playRtspInSlot(int slot, const QString &rtspUrl)
+{
+    if (slot < 0 || slot >= kMaxRtspSlots) {
+        emit playFailed(QStringLiteral("无效预览窗口索引: %1").arg(slot));
+        return false;
+    }
     if (rtspUrl.trimmed().isEmpty()) {
         emit playFailed(QStringLiteral("RTSP 地址为空"));
         return false;
@@ -245,46 +289,80 @@ bool PlaybackManager::playRtspUrl(const QString &rtspUrl)
         return false;
     }
 
-    stopRtsp();
+    std::lock_guard<std::mutex> lock(m_rtspMutex);
+    stopRtspSlotLocked(slot);
+    QString startReason;
+    if (!startRtspSlotLocked(slot, rtspUrl, startReason)) {
+        emit playFailed(QStringLiteral("RTSP 启动失败(slot=%1): %2").arg(slot).arg(startReason));
+        return false;
+    }
+    emit playStarted(QStringLiteral("slot%1: %2").arg(slot).arg(rtspUrl));
+    return true;
+}
 
-    m_rtspDecodeHandle = 0;
+bool PlaybackManager::startRtspSlotLocked(int slot, const QString &rtspUrl, QString &reason)
+{
+    auto &ctx = m_rtspSlots[slot];
+    const QString channelId = QStringLiteral("ch%1").arg(slot);
     unsigned long decodeHandle = 0;
     const auto ret = m_sdkManager.getStreamSecDecode(decodeHandle);
     if (ret != 0) {
-        emit playFailed(QStringLiteral("RTSP 申请解密通道失败, code=%1").arg(ret));
+        reason = QStringLiteral("申请解密通道失败, code=%1").arg(ret);
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(m_rtspMutex);
-        m_rtspDecodeHandle = decodeHandle;
-    }
+    ctx.decodeHandle = decodeHandle;
+    ctx.svacGotPicture = false;
+    ctx.frameUpdateQueued = false;
+    ctx.frameSerial = 0;
+    ctx.url = rtspUrl;
+    const auto generation = ctx.generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    ctx.decoder = std::make_unique<SVACDecoder>(4);
+    SvacImageProvider::clearFrame(channelId);
 
-    m_decodedFrameCount = 0;
-    m_svacGotPicture = false;
-    m_rtspPlaying = true;
+    ctx.decoder->setOnDecode([this, slot, channelId, generation](const Frame &frame) {
+        if (frame.data.empty() || frame.width <= 0 || frame.height <= 0)
+            return;
+        auto &slotCtx = m_rtspSlots[slot];
+        if (slotCtx.generation.load(std::memory_order_relaxed) != generation || !slotCtx.playing)
+            return;
+        const QImage rgbImage = yuv420pToRgbImage(frame.data.data(), frame.width, frame.height);
+        if (rgbImage.isNull())
+            return;
+        slotCtx.svacGotPicture = true;
+        bool expected = false;
+        if (!slotCtx.frameUpdateQueued.compare_exchange_strong(expected, true))
+            return;
+        QMetaObject::invokeMethod(this, [this, slot, channelId, rgbImage, generation]() {
+            auto &uiCtx = m_rtspSlots[slot];
+            if (uiCtx.generation.load(std::memory_order_relaxed) != generation || !uiCtx.playing) {
+                uiCtx.frameUpdateQueued = false;
+                return;
+            }
+            SvacImageProvider::setLatestFrame(channelId, rgbImage);
+            ++uiCtx.frameSerial;
+            ++m_frameSerial;
+            emit frameSerialChanged();
+            uiCtx.frameUpdateQueued = false;
+        }, Qt::QueuedConnection);
+    });
 
-    m_rtspClient = std::make_shared<rtspwrap::RTSPClientWrapper>();
+    ctx.client = std::make_shared<rtspwrap::RTSPClientWrapper>();
+    ctx.playing = true;
     const std::string url = rtspUrl.toStdString();
-    const bool started = m_rtspClient->start(url, [this](const uint8_t *data, unsigned size, timeval) {
-        if (!m_rtspPlaying || !data || size == 0)
+    const bool started = ctx.client->start(url, [this, slot, generation](const uint8_t *data, unsigned size, timeval) {
+        auto &slotCtx = m_rtspSlots[slot];
+        if (slotCtx.generation.load(std::memory_order_relaxed) != generation)
+            return;
+        if (!slotCtx.playing || !slotCtx.decoder || !data || size == 0 || slotCtx.decodeHandle == 0)
             return;
 
         IMG_FRAME_UNIT inFrame{};
-        // RTSP 密流先按 I 尝试，避免初始 P 帧导致底层不输出
         inFrame.type = 'I';
         inFrame.imgsz = size;
         inFrame.img_buf = const_cast<uint8_t *>(data);
 
         IMG_FRAME_UNIT *outFrame = nullptr;
-        unsigned long handle = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_rtspMutex);
-            handle = m_rtspDecodeHandle;
-        }
-        if (handle == 0)
-            return;
-
-        const auto decRet = m_sdkManager.videoDataSecDecodeExt(handle, &inFrame, &outFrame, false);
+        const auto decRet = m_sdkManager.videoDataSecDecodeExt(slotCtx.decodeHandle, &inFrame, &outFrame, false);
         if (decRet != 0 || !outFrame || !outFrame->img_buf || outFrame->imgsz == 0) {
             if (outFrame)
                 m_sdkManager.freeFrame(&outFrame);
@@ -292,24 +370,22 @@ bool PlaybackManager::playRtspUrl(const QString &rtspUrl)
         }
 
         Frame svacFrame;
-        svacFrame.keyFrame = !m_svacGotPicture;
+        svacFrame.keyFrame = !slotCtx.svacGotPicture || (outFrame->type == 'I');
         svacFrame.data.assign(outFrame->img_buf, outFrame->img_buf + outFrame->imgsz);
         svacFrame.size = svacFrame.data.size();
         svacFrame.timestamp = 0;
         svacFrame.width = static_cast<int>(outFrame->width);
         svacFrame.height = static_cast<int>(outFrame->height);
 
-        m_svacDecoder.inputFrame(svacFrame);
+        slotCtx.decoder->inputFrame(svacFrame);
         m_sdkManager.freeFrame(&outFrame);
     });
 
     if (!started) {
-        stopRtsp();
-        emit playFailed(QStringLiteral("RTSP 启动失败: %1").arg(rtspUrl));
+        stopRtspSlotLocked(slot);
+        reason = QStringLiteral("RTSP client start 返回 false");
         return false;
     }
-
-    emit playStarted(rtspUrl);
     return true;
 }
 

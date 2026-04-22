@@ -239,8 +239,8 @@ Window {
                                 })
                                 if (!root.homeWindowRef)
                                     console.log("HomePage create failed")
-                                else
-                                    root.homeWindowRef.destroyed.connect(function() { root.homeWindowRef = null })
+                                else if (root.homeWindowRef.closing)
+                                    root.homeWindowRef.closing.connect(function() { root.homeWindowRef = null })
                             } else {
                                 console.log("HomePage component error:", component.errorString())
                             }
